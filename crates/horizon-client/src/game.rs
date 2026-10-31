@@ -15992,29 +15992,33 @@ impl Game<'_> {
                             horizon_client::save::decode_lit,
                         )
                     });
-                // Past both, the server's BlueMap, if the player named it.
-                let blue_map = self
-                    .settings
-                    .horizon
-                    .blue_map
-                    .server(address)
-                    .map(|server| {
-                        use horizon_client::bluemap;
-                        log::info!("Horizon: far terrain also draws {}'s BlueMap", remote.level);
-                        let map = Arc::new(bluemap::BlueMap::new(
-                            &server.url,
-                            &remote.level,
-                            server.maps.clone(),
-                            root.join(terrain::server_folder(address)).join("BlueMap"),
-                            self.settings.horizon.blue_map.radius_blocks(),
-                            bluemap::Palette::from_game(
-                                self.pack.assets.registry,
-                                self.res.biomes(),
-                            ),
-                        ));
-                        map.start();
-                        map
-                    });
+                // Past both, the server's BlueMap, if the player named it or
+                // lets Horizon look for it (on the BlueMap worker).
+                let maps = root.join(terrain::server_folder(address)).join("BlueMap");
+                let settings = &self.settings.horizon.blue_map;
+                let blue_map = horizon_client::bluemap_detect::source(
+                    settings,
+                    address,
+                    &maps,
+                    std::time::SystemTime::now(),
+                )
+                .map(|source| {
+                    use horizon_client::{bluemap, bluemap_detect::Source};
+                    // The map's address only at debug: logs land in crash reports.
+                    log::info!("Horizon: far terrain also draws {}'s BlueMap", remote.level);
+                    if let Source::Url { url, .. } = &source {
+                        log::debug!("Horizon: BlueMap at {url}");
+                    }
+                    let map = Arc::new(bluemap::BlueMap::from_source(
+                        source,
+                        &remote.level,
+                        maps,
+                        settings.radius_blocks(),
+                        bluemap::Palette::from_game(self.pack.assets.registry, self.res.biomes()),
+                    ));
+                    map.start();
+                    map
+                });
                 self.lod_blue_map = blue_map.clone();
                 terrain::ServerTerrain::new(dir, bobby, blue_map) as _
             }),
