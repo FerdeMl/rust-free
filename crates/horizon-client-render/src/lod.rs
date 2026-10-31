@@ -511,6 +511,18 @@ impl TileKey {
         let size = self.size();
         ox < x1 && oz < z1 && ox + size > x0 && oz + size > z0
     }
+    /// Whether new data for `area` drawn in cells `widths` wide changes the
+    /// tile's samples: its cells are that wide, and it covers `area` or the
+    /// blocks around it a cell's depth reads (`bluemap::SKIRT`: a block
+    /// around a chunk, the next cells' middles past one).
+    fn refreshed_by(self, area: [i32; 4], widths: (i32, i32)) -> bool {
+        let cell = self.size() / CELLS as i32;
+        (widths.0..=widths.1).contains(&cell) && self.overlaps(Self::around(area, cell))
+    }
+    fn around([x0, z0, x1, z1]: [i32; 4], cell: i32) -> [i32; 4] {
+        let m = if cell <= 16 { 1 } else { cell };
+        [x0 - m, z0 - m, x1 + m, z1 + m]
+    }
     fn distance(self, camera: [i32; 2]) -> i32 {
         let [x, _, z] = self.origin();
         (x - camera[0])
@@ -971,6 +983,8 @@ pub struct Lod {
     /// Sampled tiles whose source has more since (`refresh`): sampled again,
     /// their old samples drawn meanwhile.
     stale: FxHashSet<TileKey>,
+    /// Stale tiles `refresh`ed again while sampled: that sample may be older.
+    restale: FxHashSet<TileKey>,
     active: FxHashSet<TileKey>,
     /// Tiles needing a mesh, with the revision their job must carry.
     dirty: FxHashMap<TileKey, u64>,
@@ -1317,6 +1331,7 @@ impl Lod {
             unmeshed: FxHashSet::default(),
             removed_pending: FxHashSet::default(),
             stale: FxHashSet::default(),
+            restale: FxHashSet::default(),
             removed: Vec::new(),
             covered: FxHashSet::default(),
             covered_bounds: None,
@@ -1624,16 +1639,25 @@ impl Lod {
         }
     }
     /// The source has new data for the blocks `[x0, z0, x1, z1)` (a map tile
-    /// downloaded since): the tiles over them are sampled again, and their
-    /// chunks' detail asked again, but for the chunks seen in the world.
-    pub fn refresh(&mut self, area: [i32; 4]) {
+    /// downloaded since), drawn in cells `widths` `(min, max)` blocks wide:
+    /// the tiles of those cells over them or beside (`refreshed_by`) are
+    /// sampled again, and their chunks' detail asked again, but for the
+    /// chunks seen in the world. A tile whose new samples are the old ones
+    /// isn't meshed again.
+    pub fn refresh(&mut self, area: [i32; 4], widths: (i32, i32)) {
         for &key in self.ready.keys() {
-            if !key.overlaps(area) || (key.level == 0 && self.covered.contains(&(key.x, key.z))) {
+            if !key.refreshed_by(area, widths)
+                || (key.level == 0 && self.covered.contains(&(key.x, key.z)))
+            {
                 continue;
             }
             self.stale.insert(key);
             self.wanted_stale = true;
+            if self.pending.contains(&key) {
+                self.restale.insert(key);
+            }
             if let Some(mask) = self.detail_masks.get_mut(&key) {
+                let area = TileKey::around(area, key.size() / CELLS as i32);
                 forget_detail(key, area, mask, |chunk| self.saved.contains_key(&chunk));
             }
         }
@@ -1687,20 +1711,30 @@ impl Lod {
         self.saved.insert(key, columns.columns.clone());
         self.finish_detail(key, columns);
     }
+    /// A chunk's own columns as its level-0 tile; the same columns again
+    /// (asked again after a `refresh`) mesh nothing.
     fn apply_fine(&mut self, (cx, cz): (i32, i32), columns: &[Column; 256]) {
         let fine = TileKey {
             x: cx,
             z: cz,
             level: 0,
         };
-        if self.plan.nodes.contains(&fine) || self.ready.contains_key(&fine) {
-            let existed = self
-                .ready
-                .insert(fine, Arc::new(columns.to_vec()))
-                .is_some();
-            self.detail_masks.insert(fine, [u64::MAX; 4]);
-            self.refresh_ready(fine, existed);
+        if !self.plan.nodes.contains(&fine) && !self.ready.contains_key(&fine) {
+            return;
         }
+        self.detail_masks.insert(fine, [u64::MAX; 4]);
+        if self
+            .ready
+            .get(&fine)
+            .is_some_and(|old| old[..] == columns[..])
+        {
+            return;
+        }
+        let existed = self
+            .ready
+            .insert(fine, Arc::new(columns.to_vec()))
+            .is_some();
+        self.refresh_ready(fine, existed);
     }
     fn apply_detail(&mut self, (cx, cz): (i32, i32), columns: &ReducedColumns) {
         self.apply_fine((cx, cz), &columns.columns);
@@ -1727,22 +1761,27 @@ impl Lod {
             if x0 == x1 || z0 == z1 {
                 continue;
             }
-            let samples = Arc::make_mut(samples);
             let mask = self.detail_masks.entry(key).or_default();
+            let mut changed = false;
             for z in z0..z1 {
                 for x in x0..x1 {
                     let index = (z * 16 + x) as usize;
-                    samples[index] = columns
-                        .get(
-                            (ox + x * stride).rem_euclid(16) as usize,
-                            (oz + z * stride).rem_euclid(16) as usize,
-                            stride as usize,
-                        )
-                        .clone();
+                    let column = columns.get(
+                        (ox + x * stride).rem_euclid(16) as usize,
+                        (oz + z * stride).rem_euclid(16) as usize,
+                        stride as usize,
+                    );
+                    // Copied (from a mesh job's snapshot) only to change it.
+                    if samples[index] != *column {
+                        Arc::make_mut(samples)[index] = column.clone();
+                        changed = true;
+                    }
                     mask[index / 64] |= 1 << (index % 64);
                 }
             }
-            modified.push(key);
+            if changed {
+                modified.push(key);
+            }
         }
         for key in modified {
             self.mark_data_changed(key);
@@ -1768,8 +1807,16 @@ impl Lod {
                     }
                 }
             }
+            // Refreshed again meanwhile: sampled once more after this.
+            if self.restale.remove(&key) {
+                self.wanted_stale = true;
+            } else {
+                self.stale.remove(&key);
+            }
+            if self.ready.get(&key).is_some_and(|old| **old == samples) {
+                return;
+            }
             let existed = self.ready.insert(key, Arc::new(samples)).is_some();
-            self.stale.remove(&key);
             self.refresh_ready(key, existed);
         }
     }
@@ -1933,6 +1980,7 @@ impl Lod {
         );
         self.ready.retain(|key, _| self.plan.nodes.contains(key));
         self.stale.retain(|key| self.plan.nodes.contains(key));
+        self.restale.retain(|key| self.plan.nodes.contains(key));
         self.detail_masks
             .retain(|key, _| self.plan.nodes.contains(key));
         // Complete resident columns need no duplicate noise work.
@@ -2967,6 +3015,17 @@ mod tests {
             level: 1,
         };
         assert!(key.overlaps([40, 0, 50, 1]) && !key.overlaps([64, 0, 80, 32]));
+        // Only cells of the widths the new data is drawn in, a cell around.
+        assert!(key.refreshed_by([64, 0, 80, 32], (1, 16)));
+        assert!(!key.refreshed_by([65, 0, 80, 32], (1, 16)));
+        assert!(!key.refreshed_by([40, 0, 50, 1], (25, i32::MAX)));
+        let root = TileKey {
+            x: 0,
+            z: 0,
+            level: MAX_LEVEL,
+        };
+        assert!(!root.refreshed_by([40, 0, 72, 32], (1, 16)));
+        assert!(root.refreshed_by([0, 0, 800, 800], (25, i32::MAX)));
         // Level 1: 2 × 2 cells a chunk, chunks 2..4 × 0..2.
         let mut mask = [u64::MAX; 4];
         forget_detail(key, [48, 0, 64, 16], &mut mask, |_| false);
