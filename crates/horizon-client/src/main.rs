@@ -4,6 +4,7 @@ mod game;
 
 use horizon_client::{crash, logging, ram_limit};
 
+#[cfg(not(feature = "system-allocator"))]
 #[global_allocator]
 static ALLOCATOR: horizon_threads::Allocator = horizon_threads::Allocator;
 
