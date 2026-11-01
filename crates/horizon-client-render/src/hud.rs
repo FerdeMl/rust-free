@@ -85,6 +85,10 @@ pub struct HudAtlas {
     pub text_shader: Option<std::sync::Arc<horizon_shaders::CoreProgram>>,
     /// The packs' OptiFine random entity textures, whose variants this atlas packs.
     pub random_textures: horizon_optifine::random_textures::RandomTextures,
+    /// Their emissive overlays (`_e`), packed here too.
+    pub emissive: std::sync::Arc<horizon_optifine::emissive::Emissive>,
+    /// ETF's blinking frames (`_blink`), packed here too.
+    pub blinks: horizon_optifine::blink::Blinks,
     white: Rect,
 }
 /// Atlas rows reserved for glyphs rasterized at run time.
@@ -136,6 +140,22 @@ pub fn decode_bytes(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
         });
     }
     Ok((info.width, info.height, rgba))
+}
+/// The most texels of OptiFine random entity variants the entity atlas packs: 2048 rows of
+/// its 4096, which keeps the default atlas (4096x5120) under the 8192 rows many GPUs take.
+const RANDOM_TEXELS: u64 = 4096 * 2048;
+/// The `files` (in order) whose sizes add up to at most `budget` texels.
+fn within_budget(files: &[&PathBuf], budget: u64) -> HashSet<PathBuf> {
+    let mut texels = 0u64;
+    files
+        .iter()
+        .filter(|p| {
+            let (w, h) = png_size(p).unwrap_or((0, 0));
+            texels += u64::from(w) * u64::from(h);
+            texels <= budget
+        })
+        .map(|p| (*p).clone())
+        .collect()
 }
 /// A PNG's width and height, from its header alone.
 fn png_size(path: &Path) -> Option<(u32, u32)> {
@@ -490,6 +510,8 @@ impl HudAtlas {
             white,
             text_shader: None,
             random_textures: Default::default(),
+            emissive: Default::default(),
+            blinks: Default::default(),
         }
     }
     /// Shelf placements of `images` (tallest first) in the narrowest atlas
@@ -585,15 +607,44 @@ impl HudAtlas {
         } else {
             Default::default()
         };
+        let emissive = std::sync::Arc::new(if folders.contains(&"entity") {
+            horizon_optifine::emissive::Emissive::scan(root, &random_textures)
+        } else {
+            Default::default()
+        });
+        let blinks = if folders.contains(&"entity") {
+            horizon_optifine::blink::Blinks::scan(root, &random_textures)
+        } else {
+            Default::default()
+        };
         let mut named: HashMap<PathBuf, String> = HashMap::new();
-        for (file, name) in random_textures.files() {
+        let extra = random_textures
+            .files()
+            .chain(emissive.files())
+            .chain(blinks.files());
+        for (file, name) in extra {
             named.insert(root.join(file), name.to_owned());
         }
         if !named.is_empty() {
+            // A pack's variants can't grow the shared atlas past what a GPU takes: every variant
+            // (those beside their texture too) counts, in name order, and those past the budget
+            // stay out (their mobs wear the texture itself), not the whole pack.
+            // Overlays only after every variant: a full budget drops glows, not looks.
+            let overlays: HashSet<PathBuf> = emissive.files().map(|(f, _)| root.join(f)).collect();
+            let mut variants: Vec<&PathBuf> = named.keys().collect();
+            variants.sort_by_key(|p| (overlays.contains(*p), *p));
+            let kept = within_budget(&variants, RANDOM_TEXELS);
+            if kept.len() < variants.len() {
+                log::warn!(
+                    "{} random entity textures left out of the atlas: past its budget",
+                    variants.len() - kept.len()
+                );
+            }
+            files.retain(|p| !named.contains_key(p) || kept.contains(p));
             // Those beside their texture are walked already.
             let walked: HashSet<&PathBuf> = files.iter().collect();
-            let mut extra: Vec<PathBuf> = named
-                .keys()
+            let mut extra: Vec<PathBuf> = kept
+                .iter()
                 .filter(|p| !walked.contains(p))
                 .cloned()
                 .collect();
@@ -815,6 +866,8 @@ impl HudAtlas {
             glint_armor,
             text_shader: None,
             random_textures,
+            emissive,
+            blinks,
             font,
             white,
         })
@@ -2319,6 +2372,82 @@ mod tests {
         // Only entity textures: the mods' others reach the atlas through atlas definitions.
         assert!(!atlas.sprites.contains_key("gems:item/ruby"));
         fs::remove_dir_all(&root).unwrap();
+    }
+    /// OptiFine random entity variants outside `textures/` pack under the names
+    /// `RandomTextures` gives them; one beside its texture packs once, under its own.
+    #[test]
+    fn random_entity_variants_pack_under_their_scan_names() {
+        let root =
+            std::env::temp_dir().join(format!("horizon-atlas-random-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let random = root.join("assets/minecraft/optifine/random/entity/pig");
+        fs::create_dir_all(&random).unwrap();
+        write_strip(&random.join("pig2.png"), 64, 64, &[[0, 200, 0, 255]], None);
+        let beside = root.join("assets/minecraft/textures/entity/cat");
+        fs::create_dir_all(&beside).unwrap();
+        fs::write(beside.join("cat.properties"), "textures.1=2").unwrap();
+        write_strip(&beside.join("cat.png"), 64, 32, &[[1, 1, 1, 255]], None);
+        write_strip(&beside.join("cat2.png"), 64, 32, &[[0, 0, 200, 255]], None);
+        let atlas = HudAtlas::build(&root).unwrap();
+        let rect = atlas.sprites["minecraft:optifine/random/entity/pig/pig2"];
+        assert_eq!(texel_at(&atlas, rect, 0, 0), [0, 200, 0, 255]);
+        let rect = atlas.sprites["entity/cat/cat2"];
+        assert_eq!(texel_at(&atlas, rect, 0, 0), [0, 0, 200, 255]);
+        assert!(atlas.random_textures.get("entity/pig/pig").is_some());
+        fs::remove_dir_all(&root).unwrap();
+    }
+    /// A random variant's emissive overlay packs beside the variant, under its name.
+    #[test]
+    fn variant_overlays_pack_under_their_names() {
+        let root =
+            std::env::temp_dir().join(format!("horizon-atlas-overlay-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let random = root.join("assets/minecraft/optifine/random/entity/zombie");
+        fs::create_dir_all(&random).unwrap();
+        write_strip(
+            &random.join("zombie3.png"),
+            64,
+            64,
+            &[[0, 200, 0, 255]],
+            None,
+        );
+        write_strip(
+            &random.join("zombie3_e.png"),
+            64,
+            64,
+            &[[200, 0, 0, 255]],
+            None,
+        );
+        let atlas = HudAtlas::build(&root).unwrap();
+        let rect = atlas.sprites["minecraft:optifine/random/entity/zombie/zombie3_e"];
+        assert_eq!(texel_at(&atlas, rect, 0, 0), [200, 0, 0, 255]);
+        assert_eq!(
+            atlas
+                .emissive
+                .overlay("minecraft:optifine/random/entity/zombie/zombie3"),
+            Some("minecraft:optifine/random/entity/zombie/zombie3_e")
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+    /// Variants past the budget, in name order, stay out of the atlas.
+    #[test]
+    fn random_variants_stop_at_their_budget() {
+        let dir = std::env::temp_dir().join(format!("horizon-atlas-budget-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let files: Vec<PathBuf> = ["a2.png", "a3.png", "a4.png"]
+            .iter()
+            .map(|n| dir.join(n))
+            .collect();
+        for f in &files {
+            write_strip(f, 16, 16, &[[1, 2, 3, 255]], None);
+        }
+        let refs: Vec<&PathBuf> = files.iter().collect();
+        // 256 texels each: 600 holds two.
+        let kept = within_budget(&refs, 600);
+        assert_eq!(kept, files[..2].iter().cloned().collect());
+        assert_eq!(within_budget(&refs, 768).len(), 3);
+        fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     fn content_mod_effect_icons_pack_under_their_namespace() {
