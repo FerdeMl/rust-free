@@ -6,6 +6,8 @@
 //! Horizon's own HUD extras do, and keep a mod's settings where the
 //! WebAssembly mod of the same id kept them.
 //!
+//! API 81 adds cancellable experience orb pickup and mutable Mending repair.
+//!
 //! API 80 adds the open screen hears of a mouse button going down or up before it acts
 //! (`native_screen_mouse_button_pressed_pre`, `native_screen_mouse_button_released_pre`, the
 //! `ScreenEvent.MouseButtonPressed.Pre` and `.MouseButtonReleased.Pre` points, with the screen, the
@@ -334,7 +336,7 @@ pub(super) use horizon_world::level::flags;
 /// The hook points' API version. The launcher reads this line from the
 /// source it builds; keep its form.
 #[allow(dead_code)]
-pub(crate) const NATIVE_HOOKS_API: u32 = 80;
+pub(crate) const NATIVE_HOOKS_API: u32 = 81;
 
 impl GameLevel<'_> {
     /// An authoritative server committed a changed state through `Level.setBlock`.
@@ -2831,6 +2833,35 @@ impl Game<'_> {
         canceled: &mut bool,
     ) {
         let _ = (player, item, count, canceled);
+    }
+    /// Before `player` picks up orb `orb` in `dimension`. Mutations to `value`
+    /// and `count` take effect only when not canceled; value is clamped to
+    /// 1..=i32::MAX and count to at least one.
+    /// Canceling leaves the orb and pickup delay unchanged. Server-side. API 81.
+    pub(super) fn native_experience_orb_pickup(
+        &mut self,
+        player: u128,
+        dimension: &str,
+        orb: u32,
+        value: &mut u32,
+        count: &mut u32,
+        canceled: &mut bool,
+    ) {
+        let _ = (player, dimension, orb, value, count, canceled);
+    }
+    /// The selected damaged Mending `stack` and the proposed durability repair
+    /// for `experience` points. The amount is clamped to the stack's current damage. Zero leaves the
+    /// experience unspent when it overrides a positive proposal. If the selected
+    /// stack changes, the repair is skipped.
+    /// Server-side, including `native_give_experience`. API 81.
+    pub(super) fn native_mending_repair(
+        &mut self,
+        player: u128,
+        stack: &ItemStack,
+        experience: u32,
+        repair: &mut u32,
+    ) {
+        let _ = (player, stack, experience, repair);
     }
     /// A player's hit landed on the mob `entity` of type `kind`
     /// (`minecraft:zombie`), holding `stack`: where `Item.hurtEnemy` is called,

@@ -551,6 +551,16 @@
       "name": "screen_mouse_button_released_pre",
       "version": 1,
       "target": "horizon_client::game::native_hooks::Game<'_>::native_screen_mouse_button_released_pre"
+    },
+    {
+      "name": "experience_orb_pickup",
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_experience_orb_pickup",
+      "version": 1
+    },
+    {
+      "name": "mending_repair",
+      "target": "horizon_client::game::native_hooks::Game<'_>::native_mending_repair",
+      "version": 1
     }
   ]
 }
