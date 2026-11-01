@@ -215,6 +215,99 @@ fn wrap_border((name, w, h, data): &PackedImage) -> PackedImage {
     }
     (name.clone(), bw, bh, out)
 }
+/// The textures the enabled packs' Custom Item Textures item rules draw, under their
+/// `cit_assets` ids, beyond those already packed; with their flags and whether they animate.
+/// They are item textures, so an animated strip keeps its first frame. None without
+/// `optifine/cit` rules.
+fn cit_sprites(
+    root: &Path,
+    packed: &[PackedImage],
+) -> Vec<(PackedImage, Option<TextureFlags>, bool)> {
+    let have: HashSet<&str> = packed.iter().map(|i| i.0.as_str()).collect();
+    let ids: Vec<String> = crate::cit_assets::item_sprites(&crate::cit::load_rules(root))
+        .into_iter()
+        // Vanilla's sprites are packed without their namespace, as `sprite_name` looks them up;
+        // Horizon's own (`horizon/white`, the run-time slots) are added after, and stay its own.
+        .filter(|id| {
+            let name = id.strip_prefix("minecraft:").unwrap_or(id);
+            !have.contains(name) && !name.starts_with("horizon/")
+        })
+        .collect();
+    // No more than the atlas could ever hold, by their headers, so a pack naming thousands of
+    // big textures is cut short before they are decoded, not after.
+    let atlas = u64::from(MAX_ATLAS_SIZE).pow(2);
+    let used: u64 = packed.iter().map(|i| u64::from(i.1) * u64::from(i.2)).sum();
+    let mut left = atlas.saturating_sub(used);
+    let before = ids.len();
+    let ids: Vec<String> = ids
+        .into_iter()
+        .take_while(|id| {
+            let path = crate::atlas_sources::texture_path(root, id, "textures");
+            let (w, h) = png_size(&path).unwrap_or((0, 0));
+            match left.checked_sub(u64::from(w) * u64::from(h)) {
+                Some(rest) => {
+                    left = rest;
+                    true
+                }
+                None => false,
+            }
+        })
+        .collect();
+    if ids.len() < before {
+        log::warn!(
+            "left out {} custom item textures: more than the atlas holds",
+            before - ids.len()
+        );
+    }
+    // Decoded on the threads `pack` decodes the rest on: a big pack names thousands.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let chunk = ids.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = ids
+            .chunks(chunk)
+            .map(|ids| scope.spawn(|| ids.iter().filter_map(|id| cit_sprite(root, id)).collect()))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| {
+                w.join().unwrap_or_else(|_| {
+                    log::warn!("a custom item texture decoder panicked; its textures are left out");
+                    Vec::new()
+                })
+            })
+            .collect()
+    })
+}
+/// One of `cit_sprites`, or `None` (with a warning) when it does not load or is too big.
+fn cit_sprite(root: &Path, id: &str) -> Option<(PackedImage, Option<TextureFlags>, bool)> {
+    let name = id.strip_prefix("minecraft:").unwrap_or(id);
+    let path = crate::atlas_sources::texture_path(root, id, "textures");
+    // The limit `pack` keeps every other texture to, for a frame; and from the header first,
+    // so an image bigger than 64 such frames is never decoded.
+    let fits = |w: u32, h: u32| w <= 1024 && h <= 512;
+    if let Some((w, h)) = png_size(&path)
+        && u64::from(w) * u64::from(h) > 1024 * 512 * 64
+    {
+        log::warn!("skipped custom item texture {}: {w}x{h}", path.display());
+        return None;
+    }
+    let image = match decode(&path) {
+        Ok(image) => image,
+        Err(e) => {
+            log::warn!("skipped custom item texture {}: {e}", path.display());
+            return None;
+        }
+    };
+    let mcmeta = fs::read_to_string(path.with_extension("png.mcmeta")).ok();
+    let animation = animation_of(mcmeta.as_deref());
+    let (w, h, pixels) = first_frame(image, animation.as_ref());
+    if !fits(w, h) {
+        log::warn!("skipped custom item texture {}: {w}x{h}", path.display());
+        return None;
+    }
+    let flags = mcmeta.as_deref().and_then(TextureFlags::from_mcmeta);
+    Some(((name.to_owned(), w, h, pixels), flags, animation.is_some()))
+}
 /// Folders of `assets/minecraft/textures/` that [`HudAtlas::pack`] walks for
 /// the full atlas. A pack may add others through `atlases/blocks.json`.
 const WALKED_TEXTURE_FOLDERS: &[&str] = &[
@@ -492,6 +585,25 @@ impl HudAtlas {
             random_textures: Default::default(),
         }
     }
+    /// `layout`, but when `extras` (Custom Item Textures) make the images more than `max`
+    /// holds, without them: they are left out, not the packs.
+    fn layout_leaving_out(
+        images: &mut Vec<PackedImage>,
+        animated: &mut Vec<String>,
+        extras: &HashSet<String>,
+        max: u32,
+    ) -> Result<(u32, Vec<(u32, u32)>, u32)> {
+        match Self::layout(images, max) {
+            Err(e) if !extras.is_empty() => {
+                images.retain(|i| !extras.contains(&i.0));
+                animated.retain(|n| !extras.contains(n));
+                let layout = Self::layout(images, max)?;
+                log::warn!("left out the custom item textures: {e}");
+                Ok(layout)
+            }
+            layout => layout,
+        }
+    }
     /// Shelf placements of `images` (tallest first) in the narrowest atlas
     /// width from 4096 up that keeps the atlas, glyph rows included, within
     /// `max` texels a side; and the first row free for glyphs. High-resolution
@@ -682,10 +794,21 @@ impl HudAtlas {
             }
             images.push(image);
         }
+        let mut cit_names = HashSet::new();
         if full {
             let (more, more_animated) = atlas_sprites(root, &images);
             images.extend(more);
             animated.extend(more_animated);
+            for (image, image_flags, is_animated) in cit_sprites(root, &images) {
+                cit_names.insert(image.0.clone());
+                if let Some(f) = image_flags {
+                    flags.insert(image.0.clone(), f);
+                }
+                if is_animated {
+                    animated.push(image.0.clone());
+                }
+                images.push(image);
+            }
         }
         // The title screen's "JAVA EDITION" banner reads "RUST EDITION".
         if let Some(edition) = images
@@ -720,7 +843,8 @@ impl HudAtlas {
             }
         }
         images.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
-        let (width, placements, glyph_region) = Self::layout(&images, MAX_ATLAS_SIZE)?;
+        let (width, placements, glyph_region) =
+            Self::layout_leaving_out(&mut images, &mut animated, &cit_names, MAX_ATLAS_SIZE)?;
         // A multiple of 1024 rather than a power of two: the default resources
         // need 4096x5120 (8192 rows before), Faithful 32x 4096x12288 (16384).
         let height = (glyph_region + GLYPH_ROWS).next_multiple_of(1024);
@@ -2463,6 +2587,176 @@ mod tests {
             .find(|(r, _)| r.u0 == rect.u0 && r.v0 == rect.v0)
             .expect("the namespaced sprite animates");
         assert_eq!(animation.frame_count(), 2);
+    }
+    /// A resource root with one plain item texture and these CIT files (relative path, contents).
+    fn cit_root(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("horizon-atlas-cit-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let item = root.join("assets/minecraft/textures/item");
+        fs::create_dir_all(&item).unwrap();
+        write_strip(&item.join("stick.png"), 16, 16, &[[90, 60, 30, 255]], None);
+        let cit = root.join("assets/minecraft/optifine/cit");
+        fs::create_dir_all(&cit).unwrap();
+        for (rel, text) in files {
+            fs::write(cit.join(rel), text).unwrap();
+        }
+        root
+    }
+    #[test]
+    fn a_cit_item_rules_texture_is_packed_under_its_id() {
+        let root = cit_root("plain", &[("a.properties", "items=stick\ntexture=a")]);
+        let cit = root.join("assets/minecraft/optifine/cit");
+        write_strip(&cit.join("a.png"), 2, 2, &[[10, 200, 30, 255]], None);
+        let atlas = HudAtlas::build(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let rect = atlas.sprites["horizon_cit:minecraft/optifine/cit/a"];
+        assert_eq!(rect.texels((atlas.width, atlas.height)), (2, 2));
+        assert_eq!(texel_at(&atlas, rect, 1, 1), [10, 200, 30, 255]);
+    }
+    #[test]
+    fn an_animated_cit_texture_packs_one_frame_and_animates() {
+        let root = cit_root("anim", &[("a.properties", "items=stick\ntexture=a")]);
+        let cit = root.join("assets/minecraft/optifine/cit");
+        write_strip(
+            &cit.join("a.png"),
+            16,
+            48,
+            &[[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]],
+            Some(r#"{"animation": {"frametime": 2}}"#),
+        );
+        let atlas = HudAtlas::build(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let rect = atlas.sprites["horizon_cit:minecraft/optifine/cit/a"];
+        assert_eq!(rect.texels((atlas.width, atlas.height)), (16, 16));
+        assert_eq!(texel_at(&atlas, rect, 0, 0), [255, 0, 0, 255]);
+        let animations: Vec<_> = atlas
+            .sprite_animations
+            .iter()
+            .filter(|(r, _)| r.u0 == rect.u0 && r.v0 == rect.v0)
+            .collect();
+        assert_eq!(animations.len(), 1);
+        assert_eq!(animations[0].1.frame_count(), 3);
+    }
+    #[test]
+    fn a_texture_only_an_armor_rule_names_is_not_packed() {
+        let root = cit_root(
+            "armor",
+            &[(
+                "a.properties",
+                "type=armor\nitems=iron_chestplate\ntexture.iron_layer_1=a",
+            )],
+        );
+        let cit = root.join("assets/minecraft/optifine/cit");
+        write_strip(&cit.join("a.png"), 64, 32, &[[1, 2, 3, 255]], None);
+        // The rule loads; only its kind keeps the texture out.
+        assert_eq!(crate::cit::load_rules(&root).len(), 1);
+        let atlas = HudAtlas::build(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert!(!atlas.sprites.keys().any(|k| k.starts_with("horizon_cit:")));
+    }
+    #[test]
+    fn named_cit_textures_pack_once_and_bad_ones_are_skipped() {
+        let root = cit_root(
+            "mixed",
+            &[
+                // Vanilla's own texture: already packed, under its usual name.
+                (
+                    "v.properties",
+                    "items=stick
+texture=item/stick",
+                ),
+                (
+                    "sub.properties",
+                    "items=bow
+texture.bow_pulling_0=b",
+                ),
+                (
+                    "broken.properties",
+                    "items=apple
+texture=broken",
+                ),
+                (
+                    "wide.properties",
+                    "items=egg
+texture=wide",
+                ),
+            ],
+        );
+        let cit = root.join("assets/minecraft/optifine/cit");
+        write_strip(&cit.join("b.png"), 2, 2, &[[5, 6, 7, 255]], None);
+        fs::write(cit.join("broken.png"), b"not a png").unwrap();
+        // Square after the crop a still texture gets, and still past the limit.
+        write_strip(&cit.join("wide.png"), 1040, 1040, &[[1, 1, 1, 255]], None);
+        // Vanilla's stick is already packed when the CIT pass runs.
+        let stick = ("item/stick".to_owned(), 16, 16, vec![0; 16 * 16 * 4]);
+        let added = cit_sprites(&root, &[stick]);
+        let names: Vec<_> = added.iter().map(|(image, _, _)| image.0.as_str()).collect();
+        assert_eq!(names, ["horizon_cit:minecraft/optifine/cit/b"]);
+        // And the atlas still builds around the broken and the too-wide texture.
+        let atlas = HudAtlas::build(&root).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            atlas
+                .sprites
+                .contains_key("horizon_cit:minecraft/optifine/cit/b")
+        );
+        assert!(atlas.sprites.contains_key("item/stick"));
+    }
+    #[test]
+    fn a_wide_grid_animation_packs_its_frame() {
+        // 1104 wide is past the limit for a still texture, not for a row of 16x16 frames.
+        let root = cit_root("grid", &[("a.properties", "items=stick\ntexture=a")]);
+        let cit = root.join("assets/minecraft/optifine/cit");
+        write_strip(&cit.join("a.png"), 1104, 16, &[[9, 9, 9, 255]], None);
+        let mcmeta = r#"{"animation":{"width":16,"height":16}}"#;
+        fs::write(cit.join("a.png.mcmeta"), mcmeta).unwrap();
+        let added = cit_sprites(&root, &[]);
+        let _ = fs::remove_dir_all(&root);
+        let sizes: Vec<_> = added.iter().map(|(i, _, _)| (i.1, i.2)).collect();
+        assert_eq!(sizes, [(16, 16)]);
+    }
+    #[test]
+    fn too_many_custom_item_textures_leave_them_out() {
+        // A 1024 atlas holds the stick and the glyph rows, not an image 1100 wide.
+        let image = |name: &str, side: u32| {
+            let pixels = vec![0; (side * side * 4) as usize];
+            (name.to_owned(), side, side, pixels)
+        };
+        let mut images = vec![image("item/stick", 16), image("horizon_cit:big", 1100)];
+        let mut animated = vec!["horizon_cit:big".to_owned()];
+        let extras = HashSet::from(["horizon_cit:big".to_owned()]);
+        assert!(HudAtlas::layout(&images, 1024).is_err());
+        HudAtlas::layout_leaving_out(&mut images, &mut animated, &extras, 1024).unwrap();
+        let names: Vec<_> = images.iter().map(|i| i.0.as_str()).collect();
+        assert_eq!(names, ["item/stick"]);
+        assert!(animated.is_empty());
+        // Without extras to leave out, it fails as before.
+        let mut alone = vec![image("item/big", 1100)];
+        let none = HashSet::new();
+        assert!(HudAtlas::layout_leaving_out(&mut alone, &mut animated, &none, 1024).is_err());
+    }
+    #[test]
+    fn a_root_without_cit_rules_packs_the_same_sprites() {
+        let root = cit_root("none", &[("a.properties", "items=stick\ntexture=a")]);
+        let cit = root.join("assets/minecraft/optifine/cit");
+        write_strip(&cit.join("a.png"), 2, 2, &[[10, 200, 30, 255]], None);
+        let with: HashSet<String> = HudAtlas::build(&root)
+            .unwrap()
+            .sprites
+            .into_keys()
+            .collect();
+        fs::remove_dir_all(root.join("assets/minecraft/optifine")).unwrap();
+        let without: HashSet<String> = HudAtlas::build(&root)
+            .unwrap()
+            .sprites
+            .into_keys()
+            .collect();
+        let _ = fs::remove_dir_all(&root);
+        assert!(without.is_subset(&with));
+        let added: Vec<_> = with.difference(&without).collect();
+        assert_eq!(added, ["horizon_cit:minecraft/optifine/cit/a"]);
+        assert!(without.contains("item/stick"));
     }
     /// `count` images of `w x h`; layout reads only their sizes.
     fn sized(count: usize, w: u32, h: u32) -> Vec<PackedImage> {
