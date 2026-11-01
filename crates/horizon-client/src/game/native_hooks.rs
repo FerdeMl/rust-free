@@ -2182,6 +2182,26 @@ impl Game<'_> {
     ) {
         let _ = (player, command, ran);
     }
+    /// A player's client started (`flying`) or stopped flying (vanilla's
+    /// `handlePlayerAbilities`, which honours it only for a player who may
+    /// fly: creative or spectator), heard once for each change, on a server,
+    /// with the player's state swapped in, so `native_tell` and the other
+    /// helpers reach them. The player is already flying or not as asked, as
+    /// vanilla leaves them; set `cancel` to refuse it: they keep the state
+    /// they had and the server sends their abilities back, as vanilla does
+    /// for what it refuses, so the client lands or flies again. Only what a
+    /// client asks for is heard: not the flight a game-mode change starts or
+    /// ends (`/gamemode`), and not a LAN host's own player.
+    /// @API:native_player_toggle_flight@.
+    pub(super) fn native_player_toggle_flight(
+        &mut self,
+        player: u128,
+        name: &str,
+        flying: bool,
+        cancel: &mut bool,
+    ) {
+        let _ = (player, name, flying, cancel);
+    }
     /// A command a player typed (NeoForge's `CommandEvent`, before
     /// `Commands.performCommand` runs it), without its slash: any command,
     /// vanilla's and the mods' own, also one the player may not run. Set

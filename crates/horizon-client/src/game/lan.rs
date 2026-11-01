@@ -2059,6 +2059,9 @@ impl Game<'_> {
                         host = self.lan.take()?;
                     }
                 }
+                HostEvent::Flight { conn, flying } => {
+                    self.lan_flight_toggled(&mut host, conn, flying);
+                }
                 HostEvent::Packet(conn, packet) => {
                     self.lan_guest_packet(&mut host, conn, *packet);
                     if !host.commands.is_empty() {
